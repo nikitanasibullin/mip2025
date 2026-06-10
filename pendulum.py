@@ -1,175 +1,164 @@
-import pybullet as p
+import os
 import time
-import pybullet_data
+
 import numpy as np
-from scipy.integrate import odeint
-import matplotlib.pyplot as plt
-from control.matlab import place, lqr
+import pybullet as p
+import pybullet_data
 
-guiFlag = False
 
-dt = 1/240 # pybullet simulation step
-th0 = 0.1  # starting position (radian)
-thd = 1.0  # desired position (radian)
-kp = 40.0  # proportional coefficient
-ki = 40.0
-kd = 20.0
-g = 10     # m/s^2
-L = 0.8    # m
-m = 1      # kg
-f0 = 10    # applied const force
+GUI = True
+DT = 1.0 / 240.0
+GRAVITY = 9.81
 
-A = np.array([[0, 1], [-g/L, 0]])
-B = np.array([[0], [1/(m*L*L)]])
-poles = np.array([-10,-20])
-K = -place(A, B, poles) # A-BK
+MOVE_DURATION = 4.0
+HOLD_DURATION = 2.0
 
-Q = np.array([[1e3,0],[0,1e-2]])
-R = 1e-2
-K, *_ = lqr(A,B,Q,R)
-K = -K
+# Цель в мировой системе координат.
+# Она должна быть достижимой для длины двух звеньев.
+TARGET_POSITION = np.array([0.70, 0.0, 2.65], dtype=float)
 
-physicsClient = p.connect(p.GUI if guiFlag else p.DIRECT) # or p.DIRECT for non-graphical version
-p.setAdditionalSearchPath(pybullet_data.getDataPath())
-p.setGravity(0,0,-g)
-planeId = p.loadURDF("plane.urdf")
-boxId = p.loadURDF("./simple.urdf.xml", useFixedBase=True)
+# Стартовая конфигурация двух суставов.
+INITIAL_JOINT_POSITIONS = [0.0, 0.0]
 
-# get rid of all the default damping forces
-# think of it as imagined "air drag"
-p.changeDynamics(boxId, 1, linearDamping=0, angularDamping=0)
-p.changeDynamics(boxId, 2, linearDamping=0, angularDamping=0)
+MAX_FORCE = 250.0
+POSITION_GAIN = 0.35
+VELOCITY_GAIN = 1.0
 
-# go to the starting position
-p.setJointMotorControl2(bodyIndex=boxId, jointIndex=1, targetPosition=th0, controlMode=p.POSITION_CONTROL)
-for _ in range(1000):
-    p.stepSimulation()
 
-# turn off the motor for the free motion
-p.setJointMotorControl2(bodyIndex=boxId, jointIndex=1, targetVelocity=0, controlMode=p.VELOCITY_CONTROL, force=0)
+def load_robot():
+    urdf_path = os.path.join(os.path.dirname(__file__), "two-link.urdf.xml")
+    robot_id = p.loadURDF(urdf_path, useFixedBase=True)
 
-maxTime = 5 # seconds
-logTime = np.arange(0, 5, dt)
-sz = len(logTime)
-logThetaSim = np.zeros(sz)
-logVelSim = np.zeros(sz)
-logTauSim = np.zeros(sz)
-idx = 0
-e_int = 0
-e_prev = 0
-for t in logTime:
-    th = p.getJointState(boxId, 1)[0]
-    vel = p.getJointState(boxId, 1)[1]
-    logThetaSim[idx] = th
-    e = th - thd
-    e_int += e*dt
-    de = (e - e_prev) / dt
-    e_prev = e
-    # PID regulator
-    # dth = -kp * e -ki * e_int - kd * de
+    movable_joints = []
+    for joint_index in range(p.getNumJoints(robot_id)):
+        joint_info = p.getJointInfo(robot_id, joint_index)
+        joint_type = joint_info[2]
+        if joint_type == p.JOINT_REVOLUTE:
+            movable_joints.append(joint_index)
 
-    # Feedback linearization
-    # tau = (m*L*L)*(g/L*np.sin(th) - kp*e - kd * vel)
+    if len(movable_joints) != 2:
+        raise RuntimeError(f"Expected 2 revolute joints, got {len(movable_joints)}")
 
-    tau = K[0,0] * th + K[0,1] * vel
-    logTauSim[idx] = tau
+    # Последний joint в URDF — это fixed joint для маркера eef.
+    end_effector_link = p.getNumJoints(robot_id) - 1
+    return robot_id, movable_joints, end_effector_link
 
-    # p.setJointMotorControl2(bodyIndex=boxId, jointIndex=1, targetVelocity=dth, controlMode=p.VELOCITY_CONTROL)
-    p.setJointMotorControl2(bodyIndex=boxId, jointIndex=1, force=tau, controlMode=p.TORQUE_CONTROL)
-    p.stepSimulation()
-    # p.setJointMotorControl2(bodyIndex=boxId, jointIndex=1, force=f0, controlMode=p.TORQUE_CONTROL)
-    vel = p.getJointState(boxId, 1)[1]
-    logVelSim[idx] = vel
 
-    idx += 1
-    if guiFlag:
-        time.sleep(dt)
-p.disconnect()
+def draw_target(target_position):
+    x, y, z = target_position.tolist()
+    s = 0.05
+    color = [1, 0, 0]
+    p.addUserDebugLine([x - s, y, z], [x + s, y, z], color, 2.5, 0)
+    p.addUserDebugLine([x, y - s, z], [x, y + s, z], color, 2.5, 0)
+    p.addUserDebugLine([x, y, z - s], [x, y, z + s], color, 2.5, 0)
 
-def right_part(x, t):
-    return np.array([x[1],
-                     -g/L * np.sin(x[0]) + f0/(m*L*L)])
 
-# substitute with pybullet-based integration method
-theta = odeint(func=right_part,
-               y0=[th0, 0],
-               t=logTime)
+def apply_position_control(robot_id, joint_ids, joint_positions):
+    for joint_index in joint_ids:
+        p.setJointMotorControl2(
+            bodyUniqueId=robot_id,
+            jointIndex=joint_index,
+            controlMode=p.POSITION_CONTROL,
+            targetPosition=float(joint_positions[joint_index]),
+            force=MAX_FORCE,
+            positionGain=POSITION_GAIN,
+            velocityGain=VELOCITY_GAIN,
+        )
 
-# l2-norm sqrt(avg sum of squares of diffs)
-# linf max(abs(diff))
 
-logThetaInt = theta[:,0]
+def main():
+    p.connect(p.GUI if GUI else p.DIRECT)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -GRAVITY)
+    p.setTimeStep(DT)
 
-plt.subplot(3,1,1)
-plt.plot(logTime, logThetaSim, 'b', label="Sim Pos")
-plt.plot([logTime[0], logTime[-1]], [thd, thd], 'r--', label="Ref Pos")
-# plt.plot(logTime, logThetaInt, 'r', label="Int Pos")
-plt.grid(True)
-plt.legend()
+    p.loadURDF("plane.urdf")
+    robot_id, joint_ids, end_effector_link = load_robot()
 
-plt.subplot(3,1,2)
-plt.plot(logTime, logVelSim, 'b', label="Sim Vel")
-plt.grid(True)
-plt.legend()
+    for joint_index, q0 in zip(joint_ids, INITIAL_JOINT_POSITIONS):
+        p.resetJointState(robot_id, joint_index, q0)
+        p.setJointMotorControl2(
+            bodyUniqueId=robot_id,
+            jointIndex=joint_index,
+            controlMode=p.POSITION_CONTROL,
+            targetPosition=q0,
+            force=0,
+        )
 
-plt.subplot(3,1,3)
-plt.plot(logTime, logTauSim, 'b', label="Sim Tau")
-plt.grid(True)
-plt.legend()
-plt.show()
+    for _ in range(120):
+        p.stepSimulation()
+        if GUI:
+            time.sleep(DT)
 
-# dt = 0.1
-# dx = f(x,t) t = [0, 0.1, 0.2]
-# x(t)
-# dx/dt = f(x,t)
-# dx = dt * f(x,t)
-# x[n+1] - x[n] = dt * f(x,t)
-# x[n+1] = x[n] + dt*f(x,t) # Euler method
+    draw_target(TARGET_POSITION)
 
-# lim(dx/dt) dt -> 0
+    start_ee = np.array(
+        p.getLinkState(robot_id, end_effector_link, computeForwardKinematics=True)[0],
+        dtype=float,
+    )
 
-# ddth = -g/L * sin(th)
-# mL^2*ddth + mgLsin(th) = tau
-# ddth = - g/Lsin(th) + tau/(mL^2)
-# tau = (mL^2)g/Lsin(th) + u(t) -> ddth = -g/Lsin(th) + ((mL^2)g/Lsin(th) + u(t))/(mL^2)
-# ddth = -g/Lsin(th) + g/Lsin(th) + u(t)
-# ddth = u(t)
-# ddth = kp(th-thd)
-# Feedback linearization
-# Линеаризация обратной связью
+    total_steps = int(MOVE_DURATION / DT)
+    hold_steps = int(HOLD_DURATION / DT)
 
-# dx = ax
-# dx(t) = f(x,t)
-# dth = w
-# dw = -g/Lsin(th)
+    try:
+        for step in range(total_steps):
+            alpha = (step + 1) / total_steps
+            desired_ee = (1.0 - alpha) * start_ee + alpha * TARGET_POSITION
 
-# dth = w
-# dw = -g/L*th
-# X = (th, w)
-# dX = A*X = [0 1; -g/L 0]
-# X = e^(A*t)
+            joint_positions = p.calculateInverseKinematics(
+                robot_id,
+                end_effector_link,
+                desired_ee.tolist(),
+                maxNumIterations=100,
+                residualThreshold=1e-6,
+            )
 
-# dx/dt = ax
-# dx / x = a dt
-# ln(x) = at + C
-# x = e^(at)
+            apply_position_control(robot_id, joint_ids, joint_positions)
+            p.stepSimulation()
 
-# LTI
-# dX = A*X + B*tau
-# tau = K*X
-# dx = A*X + B*K*X = (A+BK)X
+            if step % 120 == 0 or step == total_steps - 1:
+                ee_pos = np.array(
+                    p.getLinkState(
+                        robot_id, end_effector_link, computeForwardKinematics=True
+                    )[0],
+                    dtype=float,
+                )
+                err = np.linalg.norm(TARGET_POSITION - ee_pos)
+                print(
+                    f"step={step:4d} ee={ee_pos.round(4)} "
+                    f"target={TARGET_POSITION.round(4)} err={err:.6f}"
+                )
 
-# Forward Kinematics
-# x = -L1*sin(th1) - L2*sin(th1+th2)
-# z = H - L1*cos(th1) - L2*cos(th1+th2)
+            if GUI:
+                time.sleep(DT)
 
-# dx = -L1*cos(th1)*dth1 - L2*cos(th1+th2)*(dth1+dth2)
-# dz = L1*sin(th1)*dth1 + L2*sin(th1+th2)*(dth1+dth2)
+        for _ in range(hold_steps):
+            joint_positions = p.calculateInverseKinematics(
+                robot_id,
+                end_effector_link,
+                TARGET_POSITION.tolist(),
+                maxNumIterations=100,
+                residualThreshold=1e-6,
+            )
+            apply_position_control(robot_id, joint_ids, joint_positions)
+            p.stepSimulation()
+            if GUI:
+                time.sleep(DT)
 
-# dx = (-L1*cos(th1) - L2*cos(th1+th2))*dth1 - L2*cos(th1+th2) * dth2
-# dz = (L1*sin(th1) + L2*sin(th1+th2))*dth1 + L2*sin(th1+th2) * dth2
-# X = (x,z)'
-# Th = (th1, th2)'
-# dX = J(Th) * dTh
-# dTh = inv(J) * dX
-# dX = k(Xd - X)
+        ee_pos = np.array(
+            p.getLinkState(robot_id, end_effector_link, computeForwardKinematics=True)[0],
+            dtype=float,
+        )
+        err = np.linalg.norm(TARGET_POSITION - ee_pos)
+        print(f"Final ee position: {ee_pos.round(4)}")
+        print(f"Final error: {err:.6f}")
+
+        if GUI:
+            time.sleep(3)
+
+    finally:
+        p.disconnect()
+
+
+if __name__ == "__main__":
+    main()
