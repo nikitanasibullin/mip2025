@@ -26,9 +26,6 @@ python two-link/pendulum.py
 ### `two-link/pendulum.py`
 Сценарий для управления двухзвенным манипулятором через ползунки `target_x` и `target_z`.
 
-### `simple.urdf.xml`
-URDF-модель однозвенного манипулятора.
-
 ### `two-link/two-link.urdf.xml`
 URDF-модель двухзвенного манипулятора.
 
